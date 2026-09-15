@@ -27,6 +27,10 @@ import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import net.neoforged.neoforge.event.tick.ServerTickEvent;
 import org.slf4j.Logger;
 
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
 @Mod(VanillaWhitelistMod.MODID)
 public class VanillaWhitelistMod {
     public static final String MODID = "vanillawhitelist";
@@ -67,6 +71,12 @@ public class VanillaWhitelistMod {
     private static MessageHandler handler;
     private static Database dbInstance;
     private static long tick = 0L;
+    /** 当前服务器实例，供空服心跳线程只读使用 */
+    private static volatile MinecraftServer serverRef;
+    /** 最近一次收到服务端 tick 的时刻，用于判断 tick 是否已经停摆 */
+    private static volatile long lastTickAt = 0L;
+    /** 空服暂停时的兜底心跳调度器 */
+    private static ScheduledExecutorService heartbeat;
 
     public VanillaWhitelistMod() {
         NeoForge.EVENT_BUS.register(this);
@@ -88,6 +98,7 @@ public class VanillaWhitelistMod {
         StatsCollector.markServerStart();
         handler = new MessageHandler(config);
         handler.setServer(server);
+        serverRef = server;
         tick = 0L;
         if (!config.enabled) {
             LOGGER.info("[VWL] 配置中已禁用，不启动 WebSocket");
@@ -110,6 +121,8 @@ public class VanillaWhitelistMod {
     @SubscribeEvent
     public void onServerStopping(ServerStoppingEvent event) {
         Tracker.flush();
+        serverRef = null;
+        stopHeartbeat();
         if (dbInstance != null) {
             dbInstance.close();
             dbInstance = null;
@@ -187,6 +200,7 @@ public class VanillaWhitelistMod {
     @SubscribeEvent
     public void onServerTick(ServerTickEvent.Post event) {
         if (config == null) return;
+        lastTickAt = System.currentTimeMillis();
         MinecraftServer server = event.getServer();
         for (ServerPlayer p : server.getPlayerList().getPlayers()) {
             String to = Tracker.checkDimensionChange(p);
@@ -199,6 +213,11 @@ public class VanillaWhitelistMod {
         }
         if (transport == null) return;
         tick++;
+        if (tick % 600L == 0L) Tracker.flush();
+        // 网站不在线时不采集定时快照：这些是「当前状态」而不是事件，
+        // 缓存下来只会让网站重连后收到一批过期遥测（与 Paper 行为对齐）。
+        // 事件类消息（join/leave/death/advancement/dimension_change）不受影响，照常入队。
+        if (!transport.isConnected()) return;
         if (tick % (Math.max(1, config.pushIntervalSeconds) * 20L) == 0L) {
             push(StatsCollector.serverStats(server, config).toString());
             JsonObject alert = StatsCollector.checkAlerts(server, config);
@@ -212,7 +231,6 @@ public class VanillaWhitelistMod {
             JsonObject adv = StatsCollector.playerAdvancements(server, config, true);
             if (adv.getAsJsonArray("players").size() > 0) push(adv.toString());
         }
-        if (tick % 600L == 0L) Tracker.flush();
     }
 
     @SubscribeEvent
@@ -244,6 +262,51 @@ public class VanillaWhitelistMod {
             LOGGER.error("[VWL] WebSocket 启动失败", e);
             transport = null;
         }
+        startHeartbeat();
+    }
+
+    /**
+     * 空服暂停兜底心跳。
+     *
+     * 服务器连续 pause-when-empty-seconds（默认 60 秒）没有玩家在线时会暂停 tick，
+     * ServerTickEvent 不再触发，定时推送会整体停摆 —— 白名单服务器的常态恰恰是空的，
+     * 网站会因此把服务器误判为离线。这里用独立守护线程兜底：只有当
+     * 「tick 路径确实停了」且「当前确实没有玩家在线」时才补发一份心跳，
+     * 以免服务器真卡死时伪造存活信号。
+     */
+    private static void heartbeatCheck() {
+        try {
+            MinecraftServer srv = serverRef;
+            Transport t = transport;
+            if (srv == null || t == null || config == null || !t.isConnected()) return;
+            int seconds = Math.max(5, config.pushIntervalSeconds);
+            if (System.currentTimeMillis() - lastTickAt < seconds * 1000L + 5000L) return; // tick 路径正常
+            if (!srv.getPlayerList().getPlayers().isEmpty()) return;  // 有玩家说明 tick 没停
+            String json = StatsCollector.pausedHeartbeat(config);
+            if (json == null) return;
+            t.push(json);
+            if (config.debug) LOGGER.info("[VWL] 服务器空置暂停，已补发一次心跳");
+        } catch (Throwable e) {
+            LOGGER.debug("[VWL] 心跳检查异常: {}", e.toString());
+        }
+    }
+
+    private static void startHeartbeat() {
+        stopHeartbeat();
+        int seconds = Math.max(5, config != null ? config.pushIntervalSeconds : 30);
+        heartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "VWL-Heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
+        lastTickAt = System.currentTimeMillis();
+        heartbeat.scheduleWithFixedDelay(VanillaWhitelistMod::heartbeatCheck, seconds, seconds, TimeUnit.SECONDS);
+    }
+
+    private static void stopHeartbeat() {
+        ScheduledExecutorService hb = heartbeat;
+        heartbeat = null;
+        if (hb != null) hb.shutdownNow();
     }
 
     /** 密钥强度校验，与 Paper 行为一致；不合格则拒绝启动 WebSocket */
