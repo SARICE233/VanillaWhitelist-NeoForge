@@ -1,0 +1,13 @@
+{
+  "itemGroup.vanillawhitelist": "VanillaWhitelist Tab",
+  "block.vanillawhitelist.example_block": "Example Block",
+  "item.vanillawhitelist.example_item": "Example Item",
+
+  "vanillawhitelist.configuration.title": "VanillaWhitelist Configs",
+  "vanillawhitelist.configuration.section.vanillawhitelist.common.toml": "VanillaWhitelist Configs",
+  "vanillawhitelist.configuration.section.vanillawhitelist.common.toml.title": "VanillaWhitelist Configs",
+  "vanillawhitelist.configuration.items": "Item List",
+  "vanillawhitelist.configuration.logDirtBlock": "Log Dirt Block",
+  "vanillawhitelist.configuration.magicNumberIntroduction": "Magic Number Text",
+  "vanillawhitelist.configuration.magicNumber": "Magic Number"
+}
